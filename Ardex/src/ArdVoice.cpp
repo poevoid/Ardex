@@ -28,7 +28,7 @@ int16_t gain = 0;
 int16_t biasOffset = 0;
 uint8_t pitchPeriod = 0;
 volatile uint8_t samplePosition = 0xFF;
-uint8_t sampleDivider = 1;
+uint16_t underflowTicks = 0;
 uint8_t fadeCounter = 0;
 volatile bool fadingOut = false;
 
@@ -44,12 +44,29 @@ uint8_t fastRand8() {
   return state[index == 0 ? 6 : index - 1];
 }
 
-void silenceAndDisable() {
-  OCR4A = 127;
-#ifdef AB_ALTERNATE_WIRING
-  OCR4D = 127;
+inline void writeSample(uint8_t value) {
+#if ARDEX_AUDIO_SPEAKER1
+  OCR3A = value;
+#elif defined(AB_ALTERNATE_WIRING)
+  OCR4D = value;
+#else
+  OCR4A = value;
 #endif
-  TIMSK4 = 0;
+}
+
+void silenceAndDisable() {
+  TIMSK1 &= ~_BV(OCIE1A);
+  TCCR1B = 0;
+#if ARDEX_AUDIO_SPEAKER1
+  TCCR3A = 0; // Disconnect OC3A: 50% PWM at idle is audible through an amp.
+  TCCR3B = 0;
+  SPEAKER_1_PORT &= ~_BV(SPEAKER_1_BIT);
+#else
+  TCCR4A = 0;
+  TCCR4B = 0;
+  TCCR4C = 0;
+  SPEAKER_2_PORT &= ~_BV(SPEAKER_2_BIT);
+#endif
   samplePosition = 0xFF;
   fadingOut = false;
 }
@@ -60,12 +77,7 @@ ArdVoice::ArdVoice() {}
 void ArdVoice::playVoiceFX(uint24_t address) {
   // Shut down the old voice before touching its queue or the FX chip.
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    TIMSK4 = 0;
-    samplePosition = 0xFF;
-    OCR4A = 127;
-#ifdef AB_ALTERNATE_WIRING
-    OCR4D = 127;
-#endif
+    silenceAndDisable();
   }
   produced = consumed = 0;
   queuedFrames = totalFrames = remainingFrames = 0;
@@ -81,19 +93,38 @@ void ArdVoice::playVoiceFX(uint24_t address) {
   fadingOut = false;
   fadeCounter = 32;
   samplePosition = 0;
-  sampleDivider = 1;
+  underflowTicks = 0;
 
   // Fill the ring before starting the timer; the ISR only reads RAM.
   service();
-  TCCR4A = 0b01000010;
-  TCCR4B = 0b00000001;
+#if ARDEX_AUDIO_SPEAKER1
+  pinMode(PIN_SPEAKER_1, OUTPUT);
+  OCR3A = 127;
+  TCCR3A = _BV(COM3A1) | _BV(WGM30);
+  TCCR3B = _BV(WGM32) | _BV(CS30); // Timer3 fast 8-bit PWM, OC3A on pin 5.
+#else
+  pinMode(PIN_SPEAKER_2, OUTPUT);
   OCR4C = 0xFF;
-  OCR4A = 127;
 #ifdef AB_ALTERNATE_WIRING
-  TCCR4C = 0b01000101;
+  TCCR4A = 0b00000010;
   OCR4D = 127;
+  TCCR4C = 0b01000101; // OC4D on pin 6.
+#else
+  TCCR4A = 0b01000010;
+  OCR4C = 0xFF;
+  OCR4A = 127;          // OC4A on pin 13.
 #endif
-  TIMSK4 = 0b00000100;
+  TCCR4B = 0b00000001;
+#endif
+
+  // The encoder uses 8000 Hz samples. A dedicated compare interrupt avoids
+  // the 62.5 kHz PWM overflow ISR that could starve the display/main loop.
+  TCCR1A = 0;
+  TCCR1B = _BV(WGM12) | _BV(CS10);
+  OCR1A = F_CPU / 8000UL - 1;
+  TCNT1 = 0;
+  TIFR1 = _BV(OCF1A);
+  TIMSK1 |= _BV(OCIE1A);
 }
 
 void ArdVoice::service() {
@@ -124,10 +155,8 @@ bool ArdVoice::isVoicePlaying() {
   return samplePosition != 0xFF;
 }
 
-ISR(TIMER4_OVF_vect) {
+ISR(TIMER1_COMPA_vect) {
   if (samplePosition == 0xFF) return;
-  if (--sampleDivider) return;
-  sampleDivider = 4;
 
   if (fadingOut && !fadeCounter) {
     silenceAndDisable();
@@ -140,13 +169,12 @@ ISR(TIMER4_OVF_vect) {
       return;
     }
     if (consumed == produced) {
-      // Wait for the main loop to refill the queue without reading SPI here.
-      OCR4A = 127;
-#ifdef AB_ALTERNATE_WIRING
-      OCR4D = 127;
-#endif
+      // A blocked main loop must never leave the amplifier droning forever.
+      writeSample(127);
+      if (++underflowTicks >= 3200) silenceAndDisable(); // 400 ms at 8 kHz.
       return;
     }
+    underflowTicks = 0;
     const uint8_t *frame = frames[consumed];
     const uint8_t pitch = frame[0];
     pitchPeriod = (pitch & 0x80) ? 0 : (pitch & 0x7F) + 20;
@@ -178,9 +206,6 @@ ISR(TIMER4_OVF_vect) {
                       : 127 + ((value - 127) * (32 - fadeCounter)) / 32;
     --fadeCounter;
   }
-  OCR4A = soundBuffer[offset] = uint8_t(value);
-#ifdef AB_ALTERNATE_WIRING
-  OCR4D = soundBuffer[offset];
-#endif
+  writeSample(soundBuffer[offset] = uint8_t(value));
   if (++samplePosition >= kSamplesPerFrame) samplePosition = 0;
 }
