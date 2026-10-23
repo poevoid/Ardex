@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <ArduboyFX.h>
+#include "ArdexAudioConfig.h"
 
 class ArdVoice {
 public:

@@ -2,6 +2,11 @@
 #define ABG_SYNC_PARK_ROW
 #define SPRITESU_IMPLEMENTATION
 //#define OLED_SH1106  //for arduboy mini, set ABG_REFRESH_HZ TO 95
+#include "src/ArdexAudioConfig.h"
+#if ARDEX_AUDIO_SPEAKER1
+// Speaker 1 uses Timer3 PWM, so ArduboyG must refresh from Timer4.
+#define ABG_TIMER4
+#endif
 #define SPRITESU_OVERWRITE
 #define SPRITESU_PLUSMASK
 #define SPRITESU_FX
